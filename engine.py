@@ -1,128 +1,143 @@
-import torch, time, gc, warnings, threading
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+import gc
+import os
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+import torch
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
+
+from snap_worker import worker_restore_snapshot, worker_write_snapshot
 
 
+@dataclass(slots=True)
 class Snapshot:
-    __slots__ = ("model_id", "config", "tokenizer", "tensors",
-                 "dtype", "size_bytes", "gen_config")
-
-    def __init__(self, model_id, config, tokenizer, tensors, dtype, gen_config):
-        self.model_id = model_id
-        self.config = config
-        self.tokenizer = tokenizer
-        self.tensors = tensors
-        self.dtype = dtype
-        self.size_bytes = sum(t.nbytes for t in tensors.values()) if tensors else 0
-        self.gen_config = gen_config
+    model_id: str
+    tokenizer: object
+    snapshot_path: str
+    dtype: str
+    size_bytes: int = 0
 
 
 class SnapshotEngine:
-    """Capture GPU model state → CPU pinned memory. Restore at PCIe bandwidth."""
+    """Capture vLLM weights to snapshot files and restore quickly."""
 
-    def __init__(self, device="cuda:0"):
+    def __init__(
+        self,
+        device="cuda:0",
+        snapshot_dir="snapshots",
+        gpu_memory_utilization=0.85,
+        slot_gpu_memory_utilization=None,
+    ):
         self.device = device
+        self.snapshot_dir = Path(snapshot_dir)
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.gpu_memory_utilization = gpu_memory_utilization
+        # Each warm slot is its own dummy vLLM engine with its own KV cache; the
+        # per-slot fraction must be small enough that N slots fit in VRAM.
+        self.slot_gpu_memory_utilization = (
+            slot_gpu_memory_utilization or gpu_memory_utilization
+        )
         self.snaps: dict[str, Snapshot] = {}
         self.model = None
         self.model_id = None
         self._lock = threading.Lock()
+        self._active_snapshot = None
+        self._slots: dict[str, "LLM"] = {}
 
-    # ── load ─────────────────────────────────────────────────────────
-    def load(self, model_id, hf_name=None, dtype=torch.float16):
-        """Normal cold start: disk/HF cache → GPU. Returns seconds."""
+    def _snapshot_path(self, model_id):
+        safe = model_id.replace("/", "__").replace("\\", "__")
+        return str(self.snapshot_dir / f"{safe}.snap")
+
+    def _drop_all_slots(self):
+        if self._slots:
+            self._slots.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def load(self, model_id, hf_name=None, dtype="float16"):
+        """Normal vLLM load from model files. Returns seconds."""
         hf_name = hf_name or model_id
-        self.evict()
+        self.evict(keep_slots=False)
 
         tok = AutoTokenizer.from_pretrained(hf_name)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        m = AutoModelForCausalLM.from_pretrained(
-            hf_name, dtype=dtype,
-        ).to(self.device).eval()
-        torch.cuda.synchronize()
+        llm = LLM(
+            model=hf_name,
+            dtype=dtype,
+            enforce_eager=True,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+        )
         load_s = time.perf_counter() - t0
 
-        self.model, self.model_id = m, model_id
-        self.snaps[model_id] = Snapshot(
-            model_id, m.config, tok, {},
-            dtype, getattr(m, "generation_config", None),
-        )
+        self.model, self.model_id = llm, model_id
+        self._active_snapshot = None
+        if model_id not in self.snaps:
+            self.snaps[model_id] = Snapshot(
+                model_id, tok, self._snapshot_path(model_id), dtype, 0
+            )
         return load_s
 
-    # ── snapshot ─────────────────────────────────────────────────────
     def snapshot(self):
-        """Capture active GPU model → pinned CPU memory. Returns seconds."""
+        """Capture active vLLM model weights into a snapshot file. Returns seconds."""
         assert self.model is not None, "no active model"
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        tensors = {}
-        for k, v in self.model.state_dict().items():
-            p = torch.empty_like(v, device="cpu", pin_memory=True)
-            p.copy_(v, non_blocking=True)
-            tensors[k] = p
-        torch.cuda.synchronize()
-        snap_s = time.perf_counter() - t0
+        snap = self.snaps[self.model_id]
+        result = self.model.collective_rpc(worker_write_snapshot, args=(snap.snapshot_path,))
+        snap.size_bytes = result[0]["total_bytes"]
+        self._active_snapshot = snap.snapshot_path
+        return time.perf_counter() - t0
 
-        s = self.snaps[self.model_id]
-        s.tensors = tensors
-        s.size_bytes = sum(t.nbytes for t in tensors.values())
-        s.config = self.model.config
-        s.gen_config = getattr(self.model, "generation_config", None)
-        s.dtype = next(self.model.parameters()).dtype
-        return snap_s
-
-    # ── evict ────────────────────────────────────────────────────────
-    def evict(self):
-        """Free active model from GPU."""
+    def evict(self, keep_slots=True):
+        """Deactivate current model; keep_slots=False also drops the warm pool."""
         if self.model is not None:
-            del self.model
             self.model = self.model_id = None
+            self._active_snapshot = None
+        if keep_slots:
             gc.collect()
             torch.cuda.empty_cache()
+        else:
+            self._drop_all_slots()
 
-    # ── restore ──────────────────────────────────────────────────────
     def restore(self, model_id):
-        """Restore from pinned snapshot → GPU. Returns cold-start ms."""
+        """Restore weights into a warm dummy vLLM slot for this model. Returns ms."""
         if self.model_id == model_id:
             return 0.0
         snap = self.snaps[model_id]
-        assert snap.tensors, f"no snapshot for '{model_id}'"
-        self.evict()
+        assert os.path.exists(snap.snapshot_path), f"no snapshot file for '{model_id}'"
+        self.evict(keep_slots=True)
 
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
+        if model_id not in self._slots:
+            self._slots[model_id] = LLM(
+                model=snap.model_id,
+                dtype=snap.dtype,
+                enforce_eager=True,
+                load_format="dummy",
+                gpu_memory_utilization=self.slot_gpu_memory_utilization,
+            )
 
-        # 1. build model skeleton on meta device (zero memory, zero compute)
-        with warnings.catch_warnings(), torch.device("meta"):
-            warnings.simplefilter("ignore")
-            m = AutoModelForCausalLM.from_config(snap.config, torch_dtype=snap.dtype)
+        self.model = self._slots[model_id]
+        self.model_id = model_id
+        self.model.collective_rpc(worker_restore_snapshot, args=(snap.snapshot_path,))
 
-        # 2. DMA: pinned CPU → GPU at PCIe bandwidth (the fast path)
-        gpu_state = {k: v.to(self.device, non_blocking=True)
-                     for k, v in snap.tensors.items()}
-        torch.cuda.synchronize()
+        self._active_snapshot = snap.snapshot_path
+        return (time.perf_counter() - t0) * 1000
 
-        # 3. assign gpu tensors into the meta shell (pointer swap, no copy)
-        m.load_state_dict(gpu_state, assign=True)
-        m.eval()
-        if snap.gen_config:
-            m.generation_config = snap.gen_config
-
-        ms = (time.perf_counter() - t0) * 1000
-        self.model, self.model_id = m, model_id
-        return ms
-
-    # ── warmup (convenience) ─────────────────────────────────────────
-    def warmup(self, model_id, hf_name=None, dtype=torch.float16):
+    def warmup(self, model_id, hf_name=None, dtype="float16"):
         """Load → snapshot → evict. Returns (load_s, snap_s)."""
         ls = self.load(model_id, hf_name, dtype)
         ss = self.snapshot()
         self.evict()
         return ls, ss
 
-    # ── inference ────────────────────────────────────────────────────
     def _ensure(self, model_id):
         with self._lock:
             return self.restore(model_id)
@@ -130,61 +145,32 @@ class SnapshotEngine:
     def _prompt(self, model_id, messages):
         tok = self.snaps[model_id].tokenizer
         try:
-            return tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
+            return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
-            return "\n".join(
-                f"{m['role']}: {m['content']}" for m in messages
-            ) + "\nassistant:"
+            return "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
 
-    def _gkw(self, tok, temperature, max_tokens):
-        kw = dict(max_new_tokens=max_tokens,
-                  pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        if temperature and temperature > 0:
-            kw.update(do_sample=True, temperature=temperature)
-        else:
-            kw["do_sample"] = False
-        return kw
+    @staticmethod
+    def _sampling(temperature, max_tokens):
+        t = float(temperature) if temperature and temperature > 0 else 0.0
+        return SamplingParams(temperature=t, max_tokens=max_tokens)
+
+    def _gen_text(self, prompt, max_tokens, temperature):
+        out = self.model.generate([prompt], self._sampling(temperature, max_tokens))
+        return out[0].outputs[0].text if out and out[0].outputs else ""
 
     def generate(self, model_id, messages, max_tokens=256, temperature=0.7):
         cold_ms = self._ensure(model_id)
-        tok = self.snaps[model_id].tokenizer
-        ids = tok(self._prompt(model_id, messages),
-                  return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **ids, **self._gkw(tok, temperature, max_tokens))
-        text = tok.decode(out[0][ids.input_ids.shape[1]:],
-                          skip_special_tokens=True)
-        return cold_ms, text
+        prompt = self._prompt(model_id, messages)
+        return cold_ms, self._gen_text(prompt, max_tokens, temperature)
 
     def generate_stream(self, model_id, messages, max_tokens=256, temperature=0.7):
-        cold_ms = self._ensure(model_id)
-        tok = self.snaps[model_id].tokenizer
-        ids = tok(self._prompt(model_id, messages),
-                  return_tensors="pt").to(self.device)
-        streamer = TextIteratorStreamer(tok, skip_prompt=True,
-                                       skip_special_tokens=True)
-
-        def _run():
-            with torch.no_grad():
-                self.model.generate(
-                    **ids, **self._gkw(tok, temperature, max_tokens),
-                    streamer=streamer)
-
-        threading.Thread(target=_run, daemon=True).start()
-        return cold_ms, streamer
+        cold_ms, text = self.generate(model_id, messages, max_tokens, temperature)
+        return cold_ms, iter([text])
 
     def complete(self, model_id, prompt, max_tokens=256, temperature=0.7):
         """Plain text completion (no chat template)."""
         cold_ms = self._ensure(model_id)
-        tok = self.snaps[model_id].tokenizer
-        ids = tok(prompt, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **ids, **self._gkw(tok, temperature, max_tokens))
-        return cold_ms, tok.decode(out[0][ids.input_ids.shape[1]:],
-                                   skip_special_tokens=True)
+        return cold_ms, self._gen_text(prompt, max_tokens, temperature)
 
     def gpu_mb(self):
         return torch.cuda.memory_allocated(self.device) / 1024**2
